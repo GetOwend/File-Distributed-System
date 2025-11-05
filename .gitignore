@@ -1,0 +1,6 @@
+/.venv/*
+/dfs/*
+__pycache__/
+*.py[cod]
+*.log
+*.db
