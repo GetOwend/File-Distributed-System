@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
+from sqlalchemy import text
 
 # Import route modules
 from app.routes import files, users, metadata, storage_nodes
@@ -13,6 +14,10 @@ from app.models.schemas import HealthCheck, SystemStatus
 from app.config.settings import settings
 from app.utils.auth import get_current_user
 from app.utils.health_check import check_system_health
+
+from app.models.user_models import User
+from app.models.file_models import FileMetadata
+from app.models.file_models import StorageNode
 
 # Configure logging
 logging.basicConfig(
@@ -121,13 +126,18 @@ async def system_status(current_user: dict = Depends(get_current_user)):
     """Get detailed system status (requires authentication)"""
     try:
         db = SessionLocal()
-        # Get system statistics
-        from sqlalchemy import text
-        from models.models import File, User, StorageNode
 
-        # File statistics
-        total_files = db.query(File).count()
-        total_size = db.execute(text("SELECT COALESCE(SUM(size), 0) FROM files")).scalar()
+        # Update this query to use "files" table
+        total_files = db.query(FileMetadata).count()  # This uses the model, not raw SQL
+
+        # For total_size, use SQLAlchemy ORM instead of raw SQL
+        from sqlalchemy import func
+        total_size_result = db.query(func.sum(FileMetadata.size)).scalar()
+        total_size = total_size_result if total_size_result else 0
+
+        # Or with filter for soft-deleted files:
+        # total_files = db.query(FileMetadata).filter(FileMetadata.is_deleted == False).count()
+        # total_size = db.query(func.sum(FileMetadata.size)).filter(FileMetadata.is_deleted == False).scalar() or 0
 
         # User statistics
         total_users = db.query(User).count()

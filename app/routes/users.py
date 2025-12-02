@@ -1,5 +1,6 @@
 # app/routes/users.py
 from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import logging
@@ -9,11 +10,14 @@ import hashlib
 
 from app.models.database import get_db
 from app.models.user_models import User, UserSession, UserQuota
+from app.models.file_models import FileMetadata
 from app.models.schemas import (
     UserCreate, UserResponse, UserLogin, LoginResponse,
     UserProfile, UserQuotaResponse, UserStats
 )
-from app.utils.auth import create_access_token, verify_password, get_password_hash, get_current_user
+from app.utils.auth import create_access_token, verify_password, get_password_hash, get_current_user, security
+from jose import JWTError, jwt
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -174,12 +178,18 @@ async def get_user_profile(
     db: Session = Depends(get_db)
 ):
     """Get current user's profile information"""
+    #print(f"DEBUG 1: Entering get_user_profile for user: {current_user.username}")
+
     try:
+        #print(f"DEBUG 2: Calculating storage usage...")
+
         # Calculate current storage usage
         used_storage = db.query(func.coalesce(func.sum(FileMetadata.size), 0)).filter(
             FileMetadata.owner_id == current_user.id,
             FileMetadata.is_deleted == False
         ).scalar()
+
+        #print(f"DEBUG 3: Used storage: {used_storage}")
 
         # Get file count
         file_count = db.query(FileMetadata).filter(
@@ -187,7 +197,11 @@ async def get_user_profile(
             FileMetadata.is_deleted == False
         ).count()
 
-        return UserProfile(
+        #print(f"DEBUG 4: File count: {file_count}")
+
+        # Create the response object
+        #print(f"DEBUG 5: Creating UserProfile object...")
+        profile_response = UserProfile(
             id=current_user.id,
             username=current_user.username,
             email=current_user.email,
@@ -201,7 +215,15 @@ async def get_user_profile(
             last_login=current_user.last_login
         )
 
+        #print(f"DEBUG 6: Created profile response: {profile_response}")
+        #print(f"DEBUG 7: Type of response: {type(profile_response)}")
+
+        return profile_response
+
     except Exception as e:
+        print(f"DEBUG: Exception in get_user_profile: {str(e)}")
+        import traceback
+        traceback.print_exc()
         logger.error(f"Error getting user profile: {str(e)}")
         raise HTTPException(
             status_code=500,
@@ -294,17 +316,30 @@ async def get_user_quota(
 @router.post("/users/logout")
 async def logout_user(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    credentials: HTTPAuthorizationCredentials = Depends(security)  # Need to import security
 ):
     """Logout user and invalidate session"""
     try:
-        # In a real implementation, you might want to blacklist the token
-        # or mark the session as inactive
-        logger.info(f"User logged out: {current_user.username}")
+        token = credentials.credentials
 
-        return {"message": "Successfully logged out"}
+        # Find and invalidate the session
+        session = db.query(UserSession).filter(
+            UserSession.session_token == token,
+            UserSession.user_id == current_user.id
+        ).first()
+
+        if session:
+            session.is_active = False
+            db.commit()
+            logger.info(f"User logged out and session invalidated: {current_user.username}")
+            return {"message": "Successfully logged out", "session_invalidated": True}
+        else:
+            logger.warning(f"No session found for logout: {current_user.username}")
+            return {"message": "Logged out (no active session found)", "session_invalidated": False}
 
     except Exception as e:
+        db.rollback()
         logger.error(f"Error during logout: {str(e)}")
         raise HTTPException(
             status_code=500,

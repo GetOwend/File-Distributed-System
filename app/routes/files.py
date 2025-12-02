@@ -1,6 +1,6 @@
 # app/routes/files.py
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query, BackgroundTasks
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse as FastAPIFileResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
@@ -203,7 +203,8 @@ async def download_file(
         file_metadata.last_accessed = datetime.utcnow()
         db.commit()
 
-        return FileResponse(
+        # CRITICAL: Return FastAPI's FileResponse, not your schema FileResponse
+        return FastAPIFileResponse(
             path=file_metadata.file_path,
             filename=file_metadata.original_filename,
             media_type=file_metadata.content_type
