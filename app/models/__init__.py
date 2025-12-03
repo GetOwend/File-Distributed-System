@@ -12,5 +12,5 @@ __all__ = [
     "FileMetadata", "FileChunk", "StorageNode",
 
     # User models
-    "User", "UserSession", "UserQuota",
+    "User", "UserSession", "UserQuota", "BlacklistedToken",
 ]

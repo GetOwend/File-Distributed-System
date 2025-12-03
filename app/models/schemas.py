@@ -24,14 +24,26 @@ class FileResponse(BaseModel):
     id: int
     filename: str
     size: int
-    file_path: str
     created_at: datetime
+    is_chunked: bool = False
+    chunk_count: int = 1
+    replication_factor: int = 1
+
+    class Config:
+        from_attributes = True
 
 class FileUploadResponse(BaseModel):
     message: str
     file_id: int
     filename: str
     size: int
+    file_hash: str
+    chunk_count: int = 1
+    nodes_used: List[int] = []
+    replication_factor: int = 1
+
+    class Config:
+        from_attributes = True
 
 class FileListResponse(BaseModel):
     files: List[FileResponse]
@@ -102,6 +114,33 @@ class FileDownloadResponse(BaseModel):
     download_url: str
     size: int
     message: Optional[str] = "File ready for download"
+
+class ChunkInfo(BaseModel):
+    chunk_index: int
+    chunk_hash: str
+    size: int
+    primary_node_id: int
+    backup_node_ids: List[int] = []
+    is_stored: bool
+
+    class Config:
+        from_attributes = True
+
+class FileDetailResponse(BaseModel):
+    id: int
+    filename: str
+    size: int
+    stored_size: Optional[int]
+    file_hash: str
+    chunk_count: int
+    replication_factor: int
+    is_chunked: bool
+    content_type: Optional[str]
+    created_at: str
+    chunks: List['ChunkInfo'] = []
+
+    class Config:
+        from_attributes = True
 
 # Metadata Schemas
 class FileMetadataDetail(BaseModel):
