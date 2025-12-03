@@ -11,6 +11,7 @@ from app.config import settings
 import logging
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+from app.utils.token_blacklist import is_token_blacklisted
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +48,42 @@ async def get_current_user(
     )
 
     try:
-        payload = jwt.decode(credentials.credentials, settings.SECRET_KEY, algorithms=["HS256"])
+        token = credentials.credentials
+
+        # 1. First check if token is blacklisted (fast fail)
+        if is_token_blacklisted(db, token):
+            logger.warning(f"Attempt to use blacklisted token")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        # 2. Validate JWT token
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     except JWTError:
         raise credentials_exception
 
+    # 3. Get user from database
     user = db.query(User).filter(User.username == username).first()
     if user is None:
         raise credentials_exception
+
+    # 4. Check if user account is active
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is deactivated",
+        )
+
     return user

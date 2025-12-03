@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import logging
 import requests
-import asyncio
+import os
 from datetime import datetime, timedelta
 
 from app.models.database import get_db
@@ -76,30 +76,52 @@ async def update_all_nodes_health(db: Session):
 
 @router.on_event("startup")
 async def initialize_storage_nodes():
-    """Initialize storage nodes on startup"""
     db = next(get_db())
     try:
-        # Check if we have any storage nodes, if not create a default local node
         existing_nodes = db.query(StorageNode).count()
-        if existing_nodes == 0:
-            default_node = StorageNode(
-                node_name="local_storage",
-                node_url=f"http://{settings.HOST}:{settings.PORT}",
-                node_path=settings.STORAGE_PATH,
-                total_space=100 * 1024 * 1024 * 1024,  # 100GB
-                available_space=100 * 1024 * 1024 * 1024,
-                location="local",
-                priority=1
-            )
-            db.add(default_node)
-            db.commit()
-            logger.info("Default local storage node created")
 
-        # Initial health check
-        await update_all_nodes_health(db)
+        if existing_nodes == 0:
+            # Create 3 local nodes for testing
+            nodes = [
+                {
+                    "name": "storage_node_1",
+                    "path": "./storage/node1",
+                    "priority": 10
+                },
+                {
+                    "name": "storage_node_2",
+                    "path": "./storage/node2",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_3",
+                    "path": "./storage/node3",
+                    "priority": 5
+                }
+            ]
+
+            for i, node_info in enumerate(nodes):
+                os.makedirs(node_info["path"], exist_ok=True)
+
+                node = StorageNode(
+                    node_name=node_info["name"],
+                    node_url=f"http://localhost:{8000 + i}",  # Different "ports"
+                    node_path=node_info["path"],
+                    total_space=50 * 1024 * 1024 * 1024,  # 50GB each
+                    available_space=50 * 1024 * 1024 * 1024,
+                    used_space=0,
+                    location=f"local_{i+1}",
+                    priority=node_info["priority"],
+                    is_active=True,
+                    health_status="healthy"
+                )
+                db.add(node)
+
+            db.commit()
+            logger.info(f"Created {len(nodes)} local storage nodes")
 
     except Exception as e:
-        logger.error(f"Error initializing storage nodes: {str(e)}")
+        logger.error(f"Error: {str(e)}")
     finally:
         db.close()
 
@@ -376,3 +398,53 @@ async def get_system_overview(
     except Exception as e:
         logger.error(f"Error getting system overview: {str(e)}")
         raise HTTPException(status_code=500, detail="Error retrieving system overview")
+
+@router.get("/storage/debug")
+async def debug_storage_nodes(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint to check storage nodes status"""
+    try:
+        # Check all storage nodes
+        all_nodes = db.query(StorageNode).all()
+
+        if not all_nodes:
+            return {
+                "status": "NO_NODES",
+                "message": "No storage nodes exist in database",
+                "count": 0
+            }
+
+        # Check each node's status
+        nodes_info = []
+        for node in all_nodes:
+            nodes_info.append({
+                "id": node.id,
+                "name": node.node_name,
+                "is_active": node.is_active,
+                "health_status": node.health_status,
+                "available_space": node.available_space,
+                "total_space": node.total_space,
+                "url": node.node_url,
+                "path": node.node_path,
+                "last_heartbeat": node.last_heartbeat
+            })
+
+        # Check which nodes would be considered "available"
+        from app.utils.node_selector import get_available_storage_nodes
+        available_nodes = get_available_storage_nodes(db)
+
+        return {
+            "status": "HAS_NODES",
+            "total_nodes": len(all_nodes),
+            "available_nodes": len(available_nodes),
+            "all_nodes": nodes_info,
+            "available_node_ids": [n.id for n in available_nodes]
+        }
+
+    except Exception as e:
+        return {
+            "status": "ERROR",
+            "error": str(e)
+        }

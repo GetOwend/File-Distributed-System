@@ -108,3 +108,28 @@ class UserQuota(Base):
 
     def __repr__(self):
         return f"<UserQuota(user_id={self.user_id}, used={self.used_storage_bytes}/{self.max_storage_bytes})>"
+
+class BlacklistedToken(Base):
+    """
+    Model for tracking blacklisted/invalidated JWT tokens
+    """
+    __tablename__ = "blacklisted_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(500), unique=True, index=True, nullable=False)
+    token_hash = Column(String(64), index=True, nullable=False)  # SHA256 hash for indexing
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+
+    # Token metadata
+    jti = Column(String(36), nullable=True, index=True)  # JWT ID if available
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    # Blacklist details
+    blacklisted_at = Column(DateTime(timezone=True), server_default=func.now())
+    reason = Column(String(100), nullable=True)  # e.g., "logout", "security_breach"
+
+    # Relationships
+    user = relationship("User")
+
+    def __repr__(self):
+        return f"<BlacklistedToken(id={self.id}, user_id={self.user_id}, expires_at={self.expires_at})>"

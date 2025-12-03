@@ -18,6 +18,7 @@ from app.models.schemas import (
 from app.utils.auth import create_access_token, verify_password, get_password_hash, get_current_user, security
 from jose import JWTError, jwt
 from app.config import settings
+from app.utils.token_blacklist import add_token_to_blacklist
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -317,26 +318,64 @@ async def get_user_quota(
 async def logout_user(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    credentials: HTTPAuthorizationCredentials = Depends(security)  # Need to import security
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
-    """Logout user and invalidate session"""
+    """Logout user and invalidate token"""
     try:
         token = credentials.credentials
 
-        # Find and invalidate the session
+        # 1. Add token to blacklist
+        blacklist_success = add_token_to_blacklist(
+            db=db,
+            token=token,
+            user_id=current_user.id,
+            reason="logout"
+        )
+
+        # 2. Also invalidate UserSession if exists
+        # Find session by token (assuming session_token stores JWT)
         session = db.query(UserSession).filter(
             UserSession.session_token == token,
-            UserSession.user_id == current_user.id
+            UserSession.user_id == current_user.id,
+            UserSession.is_active == True
         ).first()
 
         if session:
             session.is_active = False
-            db.commit()
-            logger.info(f"User logged out and session invalidated: {current_user.username}")
-            return {"message": "Successfully logged out", "session_invalidated": True}
+            session_invalidated = True
         else:
-            logger.warning(f"No session found for logout: {current_user.username}")
-            return {"message": "Logged out (no active session found)", "session_invalidated": False}
+            session_invalidated = False
+
+        # 3. Also invalidate any associated refresh token
+        if session and session.refresh_token:
+            try:
+                # Blacklist refresh token too
+                add_token_to_blacklist(
+                    db=db,
+                    token=session.refresh_token,
+                    user_id=current_user.id,
+                    reason="logout_refresh"
+                )
+            except Exception as e:
+                logger.warning(f"Could not blacklist refresh token: {str(e)}")
+
+        db.commit()
+
+        if blacklist_success:
+            logger.info(f"User logged out: {current_user.username}")
+            return {
+                "message": "Successfully logged out",
+                "token_invalidated": True,
+                "session_invalidated": session_invalidated
+            }
+        else:
+            # Even if blacklisting failed, we should indicate logout
+            logger.warning(f"Logout completed but token blacklisting failed for {current_user.username}")
+            return {
+                "message": "Logged out (token may still be valid temporarily)",
+                "token_invalidated": False,
+                "session_invalidated": session_invalidated
+            }
 
     except Exception as e:
         db.rollback()
