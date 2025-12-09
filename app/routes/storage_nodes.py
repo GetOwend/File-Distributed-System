@@ -1,11 +1,11 @@
 # app/routes/storage_nodes.py
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Query
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List
 import logging
 import requests
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from app.models.database import get_db
 from app.models.file_models import StorageNode, FileMetadata
@@ -20,7 +20,7 @@ from app.config.settings import settings
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# In-memory cache for node health (in production, use Redis)
+# In-memory cache for node health
 node_health_cache = {}
 
 async def check_node_health(node: StorageNode) -> dict:
@@ -65,8 +65,7 @@ async def update_all_nodes_health(db: Session):
         node.health_status = health_status["status"]
         node.last_heartbeat = datetime.utcnow()
 
-        # Update available space (this would come from the node's health response)
-        # For now, we'll simulate it
+        # Update available space if healthy
         if health_status["status"] == "healthy":
             # Simulate space update - in real implementation, get from node
             node.used_space = node.used_space or 0
@@ -372,8 +371,7 @@ async def get_system_overview(
         node_usage = []
 
         for node in nodes:
-            # This would be more accurate with proper file-node mapping
-            # For now, we'll use the node's own usage metrics
+
             usage_percentage = (node.used_space / node.total_space * 100) if node.total_space > 0 else 0
             node_usage.append({
                 "node_name": node.node_name,

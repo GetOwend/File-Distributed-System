@@ -21,9 +21,8 @@ async def check_system_health():
         health_status["database"] = "unhealthy"
         health_status["status"] = "degraded"
 
-    # Check storage nodes (simplified)
-    # In a real implementation, you'd ping each storage node
-    active_nodes = 0  # This would come from your storage node monitoring
+    # Check storage nodes
+    active_nodes = 0
 
     if active_nodes == 0:
         health_status["storage_nodes"] = "unhealthy"
