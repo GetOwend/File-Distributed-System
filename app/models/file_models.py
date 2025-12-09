@@ -21,15 +21,15 @@ class FileMetadata(Base):
     stored_size = Column(BigInteger, nullable=True)  # Actual stored size (with replication)
 
     __table_args__ = (
-    UniqueConstraint('file_hash', 'owner_id', 'is_deleted',
-                     name='uq_file_hash_owner_not_deleted'),
+        UniqueConstraint('file_hash', 'owner_id', 'is_deleted',
+                        name='uq_file_hash_owner_not_deleted'),
     )
 
     # File info
     content_type = Column(String(100), nullable=True)
     file_extension = Column(String(50), nullable=True)
 
-    # DFS-specific fields (ADD THESE)
+    # DFS-specific fields
     chunk_count = Column(Integer, default=1)
     chunk_size = Column(BigInteger, nullable=True)  # Size per chunk in bytes
     replication_factor = Column(Integer, default=1)
@@ -38,6 +38,11 @@ class FileMetadata(Base):
     # Storage info
     storage_nodes = Column(Text, nullable=True)  # JSON array of node names (legacy)
     chunk_locations = Column(Text, nullable=True)  # JSON mapping of chunk indices to node IDs
+
+    # Access control
+    is_public = Column(Boolean, default=False)
+    permissions = Column(Text, nullable=True)  # JSON string for advanced permissions
+    public_url = Column(String(500), nullable=True, unique=True, index=True)  # Public share URL
 
     # Ownership
     owner_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
@@ -51,6 +56,11 @@ class FileMetadata(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     last_accessed = Column(DateTime(timezone=True), nullable=True)
+
+    # Versioning
+    version = Column(Integer, default=1)
+    previous_version_id = Column(Integer, ForeignKey('file_metadata.id'), nullable=True)
+    is_latest_version = Column(Boolean, default=True)
 
     # Relationships
     owner = relationship("User", back_populates="files")
@@ -68,8 +78,21 @@ class FileMetadata(Base):
             return json.loads(self.chunk_locations)
         return {}
 
+    def get_permissions(self):
+        """Parse permissions from JSON"""
+        if self.permissions:
+            return json.loads(self.permissions)
+        return {}
+
+    def generate_public_url(self):
+        """Generate a unique public URL for sharing"""
+        import secrets
+        token = secrets.token_urlsafe(16)
+        self.public_url = f"/public/files/{self.id}/{token}"
+        return self.public_url
+
     def __repr__(self):
-        return f"<FileMetadata(id={self.id}, filename='{self.filename}', size={self.size})>"
+        return f"<FileMetadata(id={self.id}, filename='{self.filename}', is_public={self.is_public})>"
 
 class FileChunk(Base):
     """Tracks individual file chunks across storage nodes"""

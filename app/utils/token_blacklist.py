@@ -94,15 +94,6 @@ def is_token_blacklisted(db: Session, token: str) -> bool:
         logger.error(f"Error checking token blacklist: {str(e)}")
         return False  # On error, assume not blacklisted to avoid blocking valid users
 
-def blacklist_all_user_tokens(db: Session, user_id: int, reason: str = "security") -> int:
-    """
-    Blacklist all tokens for a specific user (e.g., on password change)
-    Returns number of tokens blacklisted
-    """
-    # Note: This is a heavy operation, use sparingly
-    # In practice, you might want to implement a different strategy
-    pass  # Implement if needed
-
 def cleanup_expired_tokens(db: Session) -> int:
     """
     Clean up expired blacklisted tokens from database

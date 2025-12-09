@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 class HealthCheck(BaseModel):
     status: str
@@ -25,9 +25,11 @@ class FileResponse(BaseModel):
     filename: str
     size: int
     created_at: datetime
+    is_public: bool = False
     is_chunked: bool = False
     chunk_count: int = 1
     replication_factor: int = 1
+    owner_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -53,6 +55,21 @@ class FileDeleteResponse(BaseModel):
     message: str
     file_id: int
     filename: str
+
+class FileUpdateRequest(BaseModel):
+    filename: Optional[str] = None
+    description: Optional[str] = None
+
+class FileUpdateResponse(BaseModel):
+    message: str
+    file_id: int
+    filename: str
+    size: int
+    version: int
+    previous_version_id: Optional[int] = None
+
+    class Config:
+        from_attributes = True
 
 # User Schemas
 class UserCreate(BaseModel):
@@ -164,13 +181,18 @@ class FileMetadataDetail(BaseModel):
 
 class FileUpdateRequest(BaseModel):
     is_public: Optional[bool] = None
-    permissions: Optional[str] = None
+    permissions: Optional[Dict[str, Any]] = None
+    original_filename: Optional[str] = None
+    description: Optional[str] = None
 
 class FileSearchResponse(BaseModel):
     files: List[FileResponse]
     total_count: int
-    query: str
-    filters: dict
+    query: Optional[str] = None
+    filters: Dict[str, Any]
+
+    class Config:
+        from_attributes = True
 
 class MetadataResponse(BaseModel):
     total_files: int

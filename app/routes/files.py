@@ -12,14 +12,13 @@ import uuid
 import io
 from datetime import datetime
 import asyncio
-from pathlib import Path
-
 from app.models.database import get_db
 from app.models.file_models import FileMetadata, FileChunk, StorageNode
 from app.models.user_models import User
 from app.models.schemas import (
     FileResponse, FileUploadResponse, FileListResponse,
-    FileDeleteResponse, FileDownloadResponse, FileDetailResponse, ChunkInfo
+    FileDeleteResponse, FileDetailResponse, ChunkInfo,
+    FileUpdateResponse,
 )
 from app.config.settings import settings
 from app.utils.auth import get_current_user
@@ -273,20 +272,28 @@ async def list_files(
 @router.get("/files/{file_id}/download")
 async def download_file(
     file_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user),  # Make optional
     db: Session = Depends(get_db)
 ):
-    """Download a file - now ONLY handles chunked files"""
+    """Download a file - allows public access for public files"""
     try:
-        # Get file metadata with chunks
         file_metadata = db.query(FileMetadata).filter(
             FileMetadata.id == file_id,
-            FileMetadata.owner_id == current_user.id,
             FileMetadata.is_deleted == False
         ).first()
 
         if not file_metadata:
             raise HTTPException(status_code=404, detail="File not found")
+
+        # Check access permissions
+        is_owner = current_user and file_metadata.owner_id == current_user.id
+        can_access = is_owner or file_metadata.is_public
+
+        if not can_access:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have permission to access this file"
+            )
 
         # Update last accessed time
         file_metadata.last_accessed = datetime.utcnow()
@@ -594,7 +601,7 @@ async def download_chunk(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Download a specific chunk of a file (for debugging/testing)"""
+    """Download a specific chunk of a file (for debugging/testing). Verify that replication works."""
     try:
         file_metadata = db.query(FileMetadata).filter(
             FileMetadata.id == file_id,
@@ -658,3 +665,352 @@ async def download_chunk(
     except Exception as e:
         logger.error(f"Error downloading chunk: {str(e)}")
         raise HTTPException(status_code=500, detail="Chunk download failed")
+
+@router.put("/files/{file_id}", response_model=FileUpdateResponse)
+async def update_file(
+    file_id: int,
+    background_tasks: BackgroundTasks,
+    new_file: Optional[UploadFile] = File(None),
+    new_filename: Optional[str] = Query(None, description="Optional new filename"),
+    description: Optional[str] = Query(None, description="Optional description"),
+    chunk_size_mb: int = Query(5, description="Chunk size in MB"),
+    replication_factor: int = Query(2, description="Number of replicas per chunk"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    try:
+        # Get the current (latest) version of the file
+        current_file = db.query(FileMetadata).filter(
+            FileMetadata.id == file_id,
+            FileMetadata.owner_id == current_user.id,
+            FileMetadata.is_deleted == False,
+            FileMetadata.is_latest_version == True
+        ).first()
+
+        if not current_file:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # CASE 1: File content replacement
+        if new_file:
+            # Read new file content
+            file_content = await new_file.read()
+            file_size = len(file_content)
+            file_hash = hashlib.sha256(file_content).hexdigest()
+
+            # Check if new file is same as current (no-op)
+            if file_hash == current_file.file_hash:
+                # Same content, just update metadata if needed
+                if new_filename:
+                    current_file.original_filename = new_filename
+                db.commit()
+
+                return FileUpdateResponse(
+                    message="File content unchanged, metadata updated",
+                    file_id=current_file.id,
+                    filename=new_filename or current_file.original_filename,
+                    size=current_file.size,
+                    version=current_file.version
+                )
+
+            # Check quota (include new file size, subtract old if replacing)
+            user_used_storage = db.query(func.sum(FileMetadata.size)).filter(
+                FileMetadata.owner_id == current_user.id,
+                FileMetadata.is_deleted == False,
+                FileMetadata.is_latest_version == True
+            ).scalar() or 0
+
+            # For quota: new total = current total - old file + new file
+            new_total_storage = user_used_storage - current_file.size + file_size
+            if new_total_storage > current_user.storage_quota:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Storage quota exceeded with new file version"
+                )
+
+            # Save file temporarily for chunking
+            temp_dir = f"/tmp/update_{uuid.uuid4().hex}"
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file_path = os.path.join(temp_dir, new_file.filename)
+
+            with open(temp_file_path, "wb") as f:
+                f.write(file_content)
+
+            # 1. Split file into chunks
+            chunks = split_file_into_chunks(temp_file_path, chunk_size_mb)
+            if not chunks:
+                raise HTTPException(status_code=500, detail="Failed to split file into chunks")
+
+            # 2. Select storage nodes for each chunk
+            storage_nodes = get_available_storage_nodes(db)
+            if not storage_nodes:
+                raise HTTPException(
+                    status_code=503,
+                    detail="No storage nodes available"
+                )
+
+            chunk_assignments = select_nodes_for_chunks(
+                db=db,
+                num_chunks=len(chunks),
+                replication_factor=replication_factor
+            )
+
+            # 3. Distribute new chunks to nodes
+            chunk_metadata_records = []
+            total_stored_size = 0
+            nodes_used = set()
+
+            for i, chunk_data in enumerate(chunks):
+                chunk_hash = hashlib.sha256(chunk_data).hexdigest()
+                assigned_node_ids = chunk_assignments[i]
+
+                # Store chunk on each assigned node
+                stored_on_nodes = []
+                chunk_stored_successfully = False
+
+                for node_id in assigned_node_ids:
+                    storage_node = db.query(StorageNode).filter(StorageNode.id == node_id).first()
+                    if not storage_node:
+                        continue
+
+                    success = store_chunk_on_node(
+                        chunk_data=chunk_data,
+                        chunk_index=i,
+                        node=storage_node,
+                        file_hash=file_hash,
+                        chunk_hash=chunk_hash
+                    )
+
+                    if success:
+                        stored_on_nodes.append(node_id)
+                        total_stored_size += len(chunk_data)
+                        chunk_stored_successfully = True
+                        nodes_used.add(node_id)
+
+                        # Update node storage usage
+                        storage_node.used_space = (storage_node.used_space or 0) + len(chunk_data)
+                        storage_node.available_space = max(0, storage_node.total_space - storage_node.used_space)
+
+                # Create chunk metadata for new version
+                chunk_metadata = FileChunk(
+                    file_hash=file_hash,
+                    chunk_index=i,
+                    chunk_hash=chunk_hash,
+                    size=len(chunk_data),
+                    primary_node_id=assigned_node_ids[0] if assigned_node_ids else None,
+                    backup_node_ids=json.dumps(assigned_node_ids[1:]) if len(assigned_node_ids) > 1 else None,
+                    stored_on_nodes=json.dumps(stored_on_nodes),
+                    is_stored=chunk_stored_successfully
+                )
+                db.add(chunk_metadata)
+                chunk_metadata_records.append(chunk_metadata)
+
+                if not chunk_stored_successfully:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to store chunk {i} on any storage node"
+                    )
+
+            # 4. Create NEW file metadata entry (new version)
+            unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{new_file.filename}"
+
+            new_version = FileMetadata(
+                filename=unique_filename,
+                original_filename=new_filename or new_file.filename,
+                file_hash=file_hash,
+                size=file_size,
+                content_type=new_file.content_type or "application/octet-stream",
+                file_extension=os.path.splitext(new_file.filename)[1],
+                owner_id=current_user.id,
+                chunk_count=len(chunks),
+                replication_factor=replication_factor,
+                chunk_size=chunk_size_mb * 1024 * 1024,
+                stored_size=total_stored_size,
+                is_chunked=True,
+                version=current_file.version + 1,
+                previous_version_id=current_file.id,
+                is_latest_version=True
+            )
+            db.add(new_version)
+
+            # 5. Mark old version as not latest
+            current_file.is_latest_version = False
+
+            # 6. Cleanup temp files
+            background_tasks.add_task(cleanup_temp_files, temp_dir)
+
+            # 7. Schedule garbage collection of old chunks (optional)
+            background_tasks.add_task(
+                schedule_garbage_collection,
+                old_file_hash=current_file.file_hash
+            )
+
+            db.commit()
+            db.refresh(new_version)
+
+            logger.info(f"File updated to version {new_version.version}: {new_file.filename}")
+
+            return FileUpdateResponse(
+                message="File updated successfully (new version created)",
+                file_id=new_version.id,
+                filename=new_version.original_filename,
+                size=new_version.size,
+                version=new_version.version,
+                previous_version_id=current_file.id
+            )
+
+        # CASE 2: Only metadata update (rename, description, etc.)
+        else:
+            updates_made = False
+
+            if new_filename and new_filename != current_file.original_filename:
+                current_file.original_filename = new_filename
+                updates_made = True
+                logger.info(f"Renamed file {current_file.id} to {new_filename}")
+
+            if updates_made:
+                db.commit()
+                return FileUpdateResponse(
+                    message="File metadata updated",
+                    file_id=current_file.id,
+                    filename=current_file.original_filename,
+                    size=current_file.size,
+                    version=current_file.version
+                )
+            else:
+                return FileUpdateResponse(
+                    message="No changes made",
+                    file_id=current_file.id,
+                    filename=current_file.original_filename,
+                    size=current_file.size,
+                    version=current_file.version
+                )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating file: {str(e)}")
+        raise HTTPException(status_code=500, detail="File update failed")
+
+async def schedule_garbage_collection(old_file_hash: str):
+    """
+    Schedule deletion of old file chunks after a delay
+    This allows time for any ongoing operations to complete
+    """
+    import time
+    from app.models.database import SessionLocal
+
+    # Wait before garbage collection (this could honestly be anything from minutes to hours ;) )
+    await asyncio.sleep(3600)  # 1 hour delay
+
+    db = SessionLocal()
+    try:
+
+        #delete if no active file references this hash
+        active_files = db.query(FileMetadata).filter(
+            FileMetadata.file_hash == old_file_hash,
+            FileMetadata.is_deleted == False,
+            FileMetadata.is_latest_version == True
+        ).count()
+
+        if active_files == 0:
+            # No active files reference this hash, safe to delete chunks
+            chunks = db.query(FileChunk).filter(
+                FileChunk.file_hash == old_file_hash
+            ).all()
+
+            deleted_count = 0
+            for chunk in chunks:
+                stored_nodes = json.loads(chunk.stored_on_nodes) if chunk.stored_on_nodes else []
+
+                for node_id in stored_nodes:
+                    storage_node = db.query(StorageNode).filter(StorageNode.id == node_id).first()
+                    if storage_node:
+                        delete_chunk_from_node(
+                            chunk_index=chunk.chunk_index,
+                            file_hash=old_file_hash,
+                            node_path=storage_node.node_path
+                        )
+                        deleted_count += 1
+
+            # Delete chunk metadata
+            db.query(FileChunk).filter(FileChunk.file_hash == old_file_hash).delete()
+            db.commit()
+
+            logger.info(f"Garbage collected {deleted_count} chunks for old file hash: {old_file_hash[:8]}")
+        else:
+            logger.info(f"Skipping garbage collection for {old_file_hash[:8]} - still referenced by active files")
+
+    except Exception as e:
+        logger.error(f"Error in garbage collection: {str(e)}")
+    finally:
+        db.close()
+
+@router.get("/files/{file_id}/versions")
+async def get_file_versions(
+    file_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get all versions of a file"""
+    try:
+        # Get the current file to find its version chain
+        current_file = db.query(FileMetadata).filter(
+            FileMetadata.id == file_id,
+            FileMetadata.owner_id == current_user.id,
+            FileMetadata.is_deleted == False
+        ).first()
+
+        if not current_file:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        # Find all versions by walking the version chain
+        versions = []
+        file_to_check = current_file
+
+        # First, find the latest version if this isn't it
+        if not file_to_check.is_latest_version:
+            latest = db.query(FileMetadata).filter(
+                FileMetadata.previous_version_id == file_to_check.id,
+                FileMetadata.owner_id == current_user.id,
+                FileMetadata.is_deleted == False
+            ).first()
+            if latest:
+                file_to_check = latest
+
+        # Now collect all versions in the chain
+        while file_to_check:
+            versions.append({
+                "id": file_to_check.id,
+                "filename": file_to_check.original_filename,
+                "size": file_to_check.size,
+                "version": file_to_check.version,
+                "created_at": file_to_check.created_at.isoformat(),
+                "is_latest_version": file_to_check.is_latest_version,
+                "file_hash": file_to_check.file_hash[:16] + "..."
+            })
+
+            # Move to previous version
+            if file_to_check.previous_version_id:
+                file_to_check = db.query(FileMetadata).filter(
+                    FileMetadata.id == file_to_check.previous_version_id,
+                    FileMetadata.owner_id == current_user.id,
+                    FileMetadata.is_deleted == False
+                ).first()
+            else:
+                break
+
+        # Sort by version number (descending)
+        versions.sort(key=lambda x: x["version"], reverse=True)
+
+        return {
+            "file_id": current_file.id,
+            "current_filename": current_file.original_filename,
+            "total_versions": len(versions),
+            "versions": versions
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting file versions: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error retrieving file versions")

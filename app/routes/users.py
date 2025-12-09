@@ -1,12 +1,11 @@
 # app/routes/users.py
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import logging
 from datetime import datetime, timedelta
 import secrets
-import hashlib
 
 from app.models.database import get_db
 from app.models.user_models import User, UserSession, UserQuota
@@ -16,8 +15,6 @@ from app.models.schemas import (
     UserProfile, UserQuotaResponse, UserStats
 )
 from app.utils.auth import create_access_token, verify_password, get_password_hash, get_current_user, security
-from jose import JWTError, jwt
-from app.config import settings
 from app.utils.token_blacklist import add_token_to_blacklist
 
 logger = logging.getLogger(__name__)
@@ -333,7 +330,7 @@ async def logout_user(
         )
 
         # 2. Also invalidate UserSession if exists
-        # Find session by token (assuming session_token stores JWT)
+        # Find session by token
         session = db.query(UserSession).filter(
             UserSession.session_token == token,
             UserSession.user_id == current_user.id,

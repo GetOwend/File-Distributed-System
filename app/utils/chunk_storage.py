@@ -35,7 +35,8 @@ def store_chunk_on_node(
     """
     try:
         if storage_method == "http" and node.node_url and "localhost" not in node.node_url:
-            # Send chunk to remote node via HTTP
+            # Send chunk to remote node via HTTP (NOT IMPLEMENTED YET, PROBABLY NOT GONNA)
+            # DO NOT USE
             return store_chunk_via_http(
                 chunk_data=chunk_data,
                 chunk_index=chunk_index,

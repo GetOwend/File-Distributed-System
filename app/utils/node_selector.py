@@ -1,11 +1,11 @@
 # app/utils/node_selector.py
 import random
 import json
-from typing import List, Dict
+from typing import List
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 import logging
-from app.models.file_models import FileMetadata, StorageNode, FileChunk
+from app.models.file_models import StorageNode
 
 logger = logging.getLogger(__name__)
 

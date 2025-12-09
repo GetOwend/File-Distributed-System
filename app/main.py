@@ -4,8 +4,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 from contextlib import asynccontextmanager
-from typing import List, Optional
-from sqlalchemy import text
 
 # Import route modules
 from app.routes import files, users, metadata, storage_nodes
@@ -127,15 +125,14 @@ async def system_status(current_user: dict = Depends(get_current_user)):
     try:
         db = SessionLocal()
 
-        # Update this query to use "files" table
-        total_files = db.query(FileMetadata).count()  # This uses the model, not raw SQL
+        total_files = db.query(FileMetadata).count()
 
         # For total_size, use SQLAlchemy ORM instead of raw SQL
         from sqlalchemy import func
         total_size_result = db.query(func.sum(FileMetadata.size)).scalar()
         total_size = total_size_result if total_size_result else 0
 
-        # Or with filter for soft-deleted files:
+        # DO NOT COMMENT OUT, outdated but keep in case
         # total_files = db.query(FileMetadata).filter(FileMetadata.is_deleted == False).count()
         # total_size = db.query(func.sum(FileMetadata.size)).filter(FileMetadata.is_deleted == False).scalar() or 0
 
