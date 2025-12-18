@@ -24,7 +24,13 @@ from app.config.settings import settings
 from app.utils.auth import get_current_user
 from app.utils.file_chunker import split_file_into_chunks
 from app.utils.node_selector import get_available_storage_nodes, select_nodes_for_chunks
-from app.utils.chunk_storage import retrieve_chunk_from_node, store_chunk_on_node
+from app.utils.chunk_storage import (
+    retrieve_chunk_from_node,
+    store_chunk_on_node,
+    write_chunk_quorum,
+    read_chunk_quorum,
+    delete_chunk_locally,
+)
 from app.utils.cleanup import cleanup_temp_files
 from app.utils.repair import repair_file_by_id
 
@@ -46,7 +52,7 @@ async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     chunk_size_mb: int = Query(5, description="Chunk size in MB (default: 5)"),
-    replication_factor: int = Query(3, description="Number of replicas per chunk (default: 2)"),
+    replication_factor: int = Query(5, description="Number of replicas per chunk (default: 3)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -121,12 +127,17 @@ async def upload_file(
             replication_factor=replication_factor
         )
 
-        # 3. DISTRIBUTE CHUNKS TO NODES
+        # 3. DISTRIBUTE CHUNKS TO NODES using quorum writes
         chunk_metadata_records = []
         total_stored_size = 0
         nodes_used = set()
         # Track per-node usage increments to update atomically later
         node_usage_increments = {}
+        # Track successes per chunk in case we need to cleanup on failure
+        stored_chunks_successes = []
+
+        # quorum write threshold
+        w = max(1, (replication_factor // 2) + 1)
 
         for i, chunk_data in enumerate(chunks):
             chunk_hash = hashlib.sha256(chunk_data).hexdigest()
@@ -134,37 +145,46 @@ async def upload_file(
             # Get assigned nodes for this chunk
             assigned_node_ids = chunk_assignments[i]
 
-            # Store chunk on each assigned node
-            stored_on_nodes = []
-            chunk_stored_successfully = False
-
+            # Build StorageNode objects list
+            node_objs = []
             for node_id in assigned_node_ids:
                 storage_node = db.query(StorageNode).filter(StorageNode.id == node_id).first()
-                if not storage_node:
-                    continue
+                if storage_node:
+                    node_objs.append(storage_node)
 
-                # Store chunk on node
-                success = store_chunk_on_node(
-                    chunk_data=chunk_data,
-                    chunk_index=i,
-                    node=storage_node,
-                    file_hash=file_hash,
-                    chunk_hash=chunk_hash
+            # Perform quorum write
+            success_node_ids = write_chunk_quorum(
+                chunk_data=chunk_data,
+                chunk_index=i,
+                nodes=node_objs,
+                file_hash=file_hash,
+                chunk_hash=chunk_hash,
+                w=w,
+                timeout=30
+            )
+
+            if not success_node_ids or len(success_node_ids) < w:
+                # Cleanup any previously stored chunks for this file
+                for prev_index, prev_nodes in stored_chunks_successes:
+                    for nid in prev_nodes:
+                        node_row = db.query(StorageNode).filter(StorageNode.id == nid).first()
+                        if node_row:
+                            try:
+                                delete_chunk_locally(node_row.node_path, file_hash, prev_index)
+                            except Exception:
+                                pass
+
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to reach write quorum for chunk {i} (needed {w})"
                 )
 
-                if success:
-                    stored_on_nodes.append(node_id)
-                    total_stored_size += len(chunk_data)
-                    chunk_stored_successfully = True
-                    nodes_used.add(node_id)
+            # Record successes for cleanup if needed later
+            stored_chunks_successes.append((i, success_node_ids))
 
-                    # Accumulate usage increments (will apply with SELECT FOR UPDATE)
-                    node_usage_increments[node_id] = node_usage_increments.get(node_id, 0) + len(chunk_data)
-
-            # Create chunk metadata
-            # Use the first actually-stored node as the primary (if any)
-            primary_node = stored_on_nodes[0] if stored_on_nodes else None
-            backup_ids_for_meta = stored_on_nodes[1:] if len(stored_on_nodes) > 1 else []
+            # Create chunk metadata based on successful nodes
+            primary_node = success_node_ids[0] if success_node_ids else None
+            backup_ids_for_meta = success_node_ids[1:] if len(success_node_ids) > 1 else []
 
             chunk_metadata = FileChunk(
                 file_hash=file_hash,
@@ -173,17 +193,16 @@ async def upload_file(
                 size=len(chunk_data),
                 primary_node_id=primary_node,
                 backup_node_ids=json.dumps(backup_ids_for_meta) if backup_ids_for_meta else None,
-                stored_on_nodes=json.dumps(stored_on_nodes),
-                is_stored=chunk_stored_successfully
+                stored_on_nodes=json.dumps(success_node_ids),
+                is_stored=True
             )
             chunk_metadata_records.append(chunk_metadata)
 
-            # If chunk storage failed, raise error
-            if not chunk_stored_successfully:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to store chunk {i} on any storage node"
-                )
+            # Update totals and node usage increments
+            total_stored_size += len(chunk_data) * len(success_node_ids)
+            for nid in success_node_ids:
+                nodes_used.add(nid)
+                node_usage_increments[nid] = node_usage_increments.get(nid, 0) + len(chunk_data)
 
         # 4. CREATE FILE METADATA
         unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{file.filename}"
@@ -360,41 +379,67 @@ async def download_file(
                 f"metadata={file_metadata.size}, chunks={total_chunk_size}"
             )
 
-        # Create a generator to stream chunks
+        # --- Pre-check quorum availability for all chunks (fail before streaming starts) ---
+        for chunk_meta in chunks:
+            try:
+                if chunk_meta.stored_on_nodes:
+                    node_ids = json.loads(chunk_meta.stored_on_nodes)
+                else:
+                    node_ids = []
+                    if chunk_meta.primary_node_id:
+                        node_ids.append(chunk_meta.primary_node_id)
+                    if chunk_meta.backup_node_ids:
+                        node_ids.extend(json.loads(chunk_meta.backup_node_ids))
+
+                r = max(1, (file_metadata.replication_factor // 2) + 1)
+                check = read_chunk_quorum(
+                    chunk_index=chunk_meta.chunk_index,
+                    file_hash=file_metadata.file_hash,
+                    node_ids=node_ids,
+                    r=r,
+                    timeout=10
+                )
+                if check is None:
+                    logger.error(f"Quorum pre-check failed for chunk {chunk_meta.chunk_index} (r={r})")
+                    raise HTTPException(status_code=503, detail=f"Failed to retrieve chunk {chunk_meta.chunk_index} with quorum r={r}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected error during quorum pre-check for chunk {chunk_meta.chunk_index}: {str(e)}")
+                raise HTTPException(status_code=500, detail="Error during pre-check for file download")
+
+        # --- Stream chunks (generator is best-effort; on error stop streaming gracefully) ---
         async def chunk_generator():
             for chunk_meta in chunks:
+                # compute node_ids and r
+                if chunk_meta.stored_on_nodes:
+                    node_ids = json.loads(chunk_meta.stored_on_nodes)
+                else:
+                    node_ids = []
+                    if chunk_meta.primary_node_id:
+                        node_ids.append(chunk_meta.primary_node_id)
+                    if chunk_meta.backup_node_ids:
+                        node_ids.extend(json.loads(chunk_meta.backup_node_ids))
+
+                r = max(1, (file_metadata.replication_factor // 2) + 1)
+
                 try:
-                    # Retrieve chunk from primary node first
-                    chunk_data = retrieve_chunk_from_node(
+                    chunk_data = read_chunk_quorum(
                         chunk_index=chunk_meta.chunk_index,
                         file_hash=file_metadata.file_hash,
-                        node_id=chunk_meta.primary_node_id,
-                        db=db
+                        node_ids=node_ids,
+                        r=r,
+                        timeout=10
                     )
 
-                    # If primary fails, try backup nodes
-                    if chunk_data is None and chunk_meta.backup_node_ids:
-                        backup_ids = json.loads(chunk_meta.backup_node_ids)
-                        for backup_id in backup_ids:
-                            chunk_data = retrieve_chunk_from_node(
-                                chunk_index=chunk_meta.chunk_index,
-                                file_hash=file_metadata.file_hash,
-                                node_id=backup_id,
-                                db=db
-                            )
-                            if chunk_data:
-                                logger.info(
-                                    f"Used backup node {backup_id} for chunk "
-                                    f"{chunk_meta.chunk_index} of {file_metadata.filename}"
-                                )
-                                break
-
                     if chunk_data is None:
-                        raise Exception(f"Failed to retrieve chunk {chunk_meta.chunk_index}")
+                        logger.error(f"Quorum read failed during streaming for chunk {chunk_meta.chunk_index} (r={r})")
+                        return
 
                     # Verify chunk hash for integrity
                     if hashlib.sha256(chunk_data).hexdigest() != chunk_meta.chunk_hash:
-                        raise Exception(f"Chunk {chunk_meta.chunk_index} hash mismatch")
+                        logger.error(f"Chunk {chunk_meta.chunk_index} hash mismatch during streaming")
+                        return
 
                     # Verify chunk size
                     if len(chunk_data) != chunk_meta.size:
@@ -406,11 +451,8 @@ async def download_file(
                     yield chunk_data
 
                 except Exception as e:
-                    logger.error(f"Error retrieving chunk {chunk_meta.chunk_index}: {str(e)}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to retrieve chunk {chunk_meta.chunk_index}"
-                    )
+                    logger.error(f"Error retrieving chunk {chunk_meta.chunk_index} during streaming: {str(e)}")
+                    return
 
         # Return streaming response
         return StreamingResponse(
@@ -651,29 +693,27 @@ async def download_chunk(
         if not chunk_meta:
             raise HTTPException(status_code=404, detail="Chunk not found")
 
-        # Retrieve chunk data
-        chunk_data = retrieve_chunk_from_node(
+        # Attempt quorum read for the chunk
+        if chunk_meta.stored_on_nodes:
+            node_ids = json.loads(chunk_meta.stored_on_nodes)
+        else:
+            node_ids = []
+            if chunk_meta.primary_node_id:
+                node_ids.append(chunk_meta.primary_node_id)
+            if chunk_meta.backup_node_ids:
+                node_ids.extend(json.loads(chunk_meta.backup_node_ids))
+
+        r = max(1, (file_metadata.replication_factor // 2) + 1)
+        chunk_data = read_chunk_quorum(
             chunk_index=chunk_index,
             file_hash=file_metadata.file_hash,
-            node_id=chunk_meta.primary_node_id,
-            db=db
+            node_ids=node_ids,
+            r=r,
+            timeout=10
         )
 
-        if chunk_data is None and chunk_meta.backup_node_ids:
-            # Try backup nodes
-            backup_ids = json.loads(chunk_meta.backup_node_ids)
-            for backup_id in backup_ids:
-                chunk_data = retrieve_chunk_from_node(
-                    chunk_index=chunk_index,
-                    file_hash=file_metadata.file_hash,
-                    node_id=backup_id,
-                    db=db
-                )
-                if chunk_data:
-                    break
-
         if chunk_data is None:
-            raise HTTPException(status_code=404, detail="Chunk not found on any storage node")
+            raise HTTPException(status_code=404, detail="Chunk not found on any storage node (quorum failure)")
 
         # Verify hash
         if hashlib.sha256(chunk_data).hexdigest() != chunk_meta.chunk_hash:
@@ -788,39 +828,50 @@ async def update_file(
             nodes_used = set()
             node_usage_increments = {}
 
+            # Use quorum writes for update as well
+            stored_chunks_successes = []
+            w = max(1, (replication_factor // 2) + 1)
+
             for i, chunk_data in enumerate(chunks):
                 chunk_hash = hashlib.sha256(chunk_data).hexdigest()
                 assigned_node_ids = chunk_assignments[i]
 
-                # Store chunk on each assigned node
-                stored_on_nodes = []
-                chunk_stored_successfully = False
-
+                node_objs = []
                 for node_id in assigned_node_ids:
                     storage_node = db.query(StorageNode).filter(StorageNode.id == node_id).first()
-                    if not storage_node:
-                        continue
+                    if storage_node:
+                        node_objs.append(storage_node)
 
-                    success = store_chunk_on_node(
-                        chunk_data=chunk_data,
-                        chunk_index=i,
-                        node=storage_node,
-                        file_hash=file_hash,
-                        chunk_hash=chunk_hash
+                success_node_ids = write_chunk_quorum(
+                    chunk_data=chunk_data,
+                    chunk_index=i,
+                    nodes=node_objs,
+                    file_hash=file_hash,
+                    chunk_hash=chunk_hash,
+                    w=w,
+                    timeout=30
+                )
+
+                if not success_node_ids or len(success_node_ids) < w:
+                    # cleanup previous written chunks for this update
+                    for prev_index, prev_nodes in stored_chunks_successes:
+                        for nid in prev_nodes:
+                            node_row = db.query(StorageNode).filter(StorageNode.id == nid).first()
+                            if node_row:
+                                try:
+                                    delete_chunk_locally(node_row.node_path, file_hash, prev_index)
+                                except Exception:
+                                    pass
+
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to reach write quorum for chunk {i} (needed {w})"
                     )
 
-                    if success:
-                        stored_on_nodes.append(node_id)
-                        total_stored_size += len(chunk_data)
-                        chunk_stored_successfully = True
-                        nodes_used.add(node_id)
+                stored_chunks_successes.append((i, success_node_ids))
 
-                        # Accumulate usage increments
-                        node_usage_increments[node_id] = node_usage_increments.get(node_id, 0) + len(chunk_data)
-
-                # Create chunk metadata for new version
-                primary_node = stored_on_nodes[0] if stored_on_nodes else None
-                backup_ids_for_meta = stored_on_nodes[1:] if len(stored_on_nodes) > 1 else []
+                primary_node = success_node_ids[0] if success_node_ids else None
+                backup_ids_for_meta = success_node_ids[1:] if len(success_node_ids) > 1 else []
 
                 chunk_metadata = FileChunk(
                     file_hash=file_hash,
@@ -829,17 +880,15 @@ async def update_file(
                     size=len(chunk_data),
                     primary_node_id=primary_node,
                     backup_node_ids=json.dumps(backup_ids_for_meta) if backup_ids_for_meta else None,
-                    stored_on_nodes=json.dumps(stored_on_nodes),
-                    is_stored=chunk_stored_successfully
+                    stored_on_nodes=json.dumps(success_node_ids),
+                    is_stored=True
                 )
-                # do not persist chunk metadata yet; collect for atomic commit
                 chunk_metadata_records.append(chunk_metadata)
 
-                if not chunk_stored_successfully:
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to store chunk {i} on any storage node"
-                    )
+                total_stored_size += len(chunk_data) * len(success_node_ids)
+                for nid in success_node_ids:
+                    nodes_used.add(nid)
+                    node_usage_increments[nid] = node_usage_increments.get(nid, 0) + len(chunk_data)
 
             # 4. Create NEW file metadata entry (new version)
             unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{new_file.filename}"

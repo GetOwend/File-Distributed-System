@@ -31,7 +31,7 @@ def get_available_storage_nodes(db: Session, min_space_mb: int = 10) -> List:
 def select_nodes_for_chunks(
     db: Session,
     num_chunks: int,
-    replication_factor: int = 2,
+    replication_factor: int = 3,
     strategy: str = "balanced"
 ) -> List[List[int]]:
     """

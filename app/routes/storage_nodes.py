@@ -93,8 +93,17 @@ async def check_node_health(node: StorageNode) -> dict:
                 total_space = node.total_space or 0
 
             available = max(0, (total_space - used_bytes) if total_space else 0)
-
-            status = "healthy" if chunks_exist else "degraded"
+            # Consider the node healthy if its path exists; an empty chunks directory
+            # is not a failure state. Use 'degraded' only for low-availability conditions.
+            if not node.node_path or not os.path.exists(node.node_path):
+                status = "offline"
+            else:
+                # If disk space is extremely low, mark degraded; otherwise healthy
+                low_space_threshold = 1024 * 1024 * 10  # 10MB safety threshold
+                if total_space and available < low_space_threshold:
+                    status = "degraded"
+                else:
+                    status = "healthy"
             details = {"chunks_dir_exists": chunks_exist, "used_bytes": used_bytes, "available_bytes": available}
 
             info.update({"status": status, "details": details, "used_bytes": used_bytes, "available_bytes": available})
@@ -147,7 +156,7 @@ async def initialize_storage_nodes():
         existing_nodes = db.query(StorageNode).count()
 
         if existing_nodes == 0:
-            # Create 3 local nodes for testing
+            # Create 10 local nodes for testing
             nodes = [
                 {
                     "name": "storage_node_1",
@@ -172,6 +181,31 @@ async def initialize_storage_nodes():
                 {
                     "name": "storage_node_5",
                     "path": "./storage/node5",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_6",
+                    "path": "./storage/node6",
+                    "priority": 10
+                },
+                {
+                    "name": "storage_node_7",
+                    "path": "./storage/node7",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_8",
+                    "path": "./storage/node8",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_9",
+                    "path": "./storage/node9",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_10",
+                    "path": "./storage/node10",
                     "priority": 5
                 }
             ]
