@@ -5,6 +5,9 @@ from typing import List
 import logging
 import requests
 import os
+import glob
+import shutil
+import asyncio
 from datetime import datetime
 
 from app.models.database import get_db
@@ -24,31 +27,84 @@ router = APIRouter()
 node_health_cache = {}
 
 async def check_node_health(node: StorageNode) -> dict:
-    """Check the health of a storage node"""
-    try:
-        # Simple health check - try to connect to the node
-        health_url = f"{node.node_url}/health"
-        response = requests.get(health_url, timeout=5)
+    """Check the health of a storage node.
 
-        if response.status_code == 200:
-            health_data = response.json()
-            return {
-                "status": "healthy",
-                "response_time": response.elapsed.total_seconds(),
-                "details": health_data
-            }
-        else:
-            return {
-                "status": "unhealthy",
-                "response_time": response.elapsed.total_seconds(),
-                "details": f"HTTP {response.status_code}"
-            }
-    except requests.exceptions.RequestException as e:
-        return {
-            "status": "offline",
-            "response_time": None,
-            "details": str(e)
-        }
+    Behavior:
+    - If `settings.USE_HTTP_NODES` is True and the node has a `node_url`, perform
+      an HTTP health probe (existing behavior, but executed in a thread).
+    - Otherwise, perform filesystem checks against `node.node_path`:
+        - Verify path and `chunks/` directory exist
+        - Sum chunk file sizes (or use `shutil.disk_usage`) to compute used/available
+        - Set health_status based on presence of chunks
+    """
+    try:
+        # Use HTTP probe when configured to use HTTP-based nodes
+        if getattr(settings, "USE_HTTP_NODES", False) and node.node_url:
+            try:
+                def http_probe():
+                    return requests.get(f"{node.node_url.rstrip('/')}/health", timeout=5)
+
+                response = await asyncio.to_thread(http_probe)
+                if response.status_code == 200:
+                    health_data = response.json()
+                    return {
+                        "status": "healthy",
+                        "response_time": response.elapsed.total_seconds(),
+                        "details": health_data
+                    }
+                else:
+                    return {
+                        "status": "unhealthy",
+                        "response_time": response.elapsed.total_seconds() if hasattr(response, 'elapsed') else None,
+                        "details": f"HTTP {response.status_code}"
+                    }
+            except requests.exceptions.RequestException as e:
+                return {
+                    "status": "offline",
+                    "response_time": None,
+                    "details": str(e)
+                }
+
+        # Otherwise, perform filesystem-based health check (local node)
+        def fs_probe():
+            chunks_dir = os.path.join(node.node_path or "", "chunks")
+            info = {"response_time": None}
+
+            if not node.node_path or not os.path.exists(node.node_path):
+                info.update({"status": "offline", "details": None})
+                return info
+
+            # Ensure chunks directory presence
+            chunks_exist = os.path.exists(chunks_dir)
+
+            # Sum sizes of chunk files
+            used_bytes = 0
+            if chunks_exist:
+                for p in glob.glob(os.path.join(chunks_dir, "*.chunk")):
+                    try:
+                        used_bytes += os.path.getsize(p)
+                    except OSError:
+                        pass
+
+            # If total_space set, compute available; otherwise attempt disk usage
+            try:
+                total_space = node.total_space or shutil.disk_usage(node.node_path).total
+            except Exception:
+                total_space = node.total_space or 0
+
+            available = max(0, (total_space - used_bytes) if total_space else 0)
+
+            status = "healthy" if chunks_exist else "degraded"
+            details = {"chunks_dir_exists": chunks_exist, "used_bytes": used_bytes, "available_bytes": available}
+
+            info.update({"status": status, "details": details, "used_bytes": used_bytes, "available_bytes": available})
+            return info
+
+        fs_info = await asyncio.to_thread(fs_probe)
+        return fs_info
+
+    except Exception as e:
+        return {"status": "offline", "response_time": None, "details": str(e)}
 
 async def update_all_nodes_health(db: Session):
     """Update health status for all storage nodes"""
@@ -62,14 +118,25 @@ async def update_all_nodes_health(db: Session):
         }
 
         # Update node status in database
-        node.health_status = health_status["status"]
         node.last_heartbeat = datetime.utcnow()
 
-        # Update available space if healthy
-        if health_status["status"] == "healthy":
-            # Simulate space update - in real implementation, get from node
+        # If HTTP probe returned simple dict with 'status', use it
+        status = health_status.get("status")
+        if status:
+            node.health_status = status
+
+        # If filesystem probe returned used/available, update node stats
+        if "used_bytes" in health_status:
+            try:
+                node.used_space = int(health_status.get("used_bytes") or 0)
+                node.available_space = int(health_status.get("available_bytes") or max(0, (node.total_space or 0) - (node.used_space or 0)))
+            except Exception:
+                node.used_space = node.used_space or 0
+                node.available_space = node.available_space or node.total_space
+        else:
+            # Keep existing DB values if HTTP probe used
             node.used_space = node.used_space or 0
-            node.available_space = max(0, node.total_space - node.used_space)
+            node.available_space = node.available_space or max(0, (node.total_space or 0) - (node.used_space or 0))
 
     db.commit()
 
@@ -95,6 +162,16 @@ async def initialize_storage_nodes():
                 {
                     "name": "storage_node_3",
                     "path": "./storage/node3",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_4",
+                    "path": "./storage/node4",
+                    "priority": 5
+                },
+                {
+                    "name": "storage_node_5",
+                    "path": "./storage/node5",
                     "priority": 5
                 }
             ]
@@ -132,6 +209,10 @@ async def list_storage_nodes(
 ):
     """List all storage nodes in the system"""
     try:
+        # Trigger health check
+        task = asyncio.create_task(update_all_nodes_health(db))
+        await task
+
         query = db.query(StorageNode)
         if active_only:
             query = query.filter(StorageNode.is_active == True)
@@ -302,8 +383,9 @@ async def get_nodes_health(
 ):
     """Get health status of all storage nodes"""
     try:
-        # Trigger background health check
-        background_tasks.add_task(update_all_nodes_health, db)
+        # Trigger health check
+        task = asyncio.create_task(update_all_nodes_health(db))
+        await task
 
         nodes = db.query(StorageNode).all()
 
@@ -313,7 +395,7 @@ async def get_nodes_health(
         node_statuses = []
         for node in nodes:
             health_info = node_health_cache.get(node.id, {})
-            status = health_info.get("status", "unknown")
+            status = health_info.get("status")
 
             if status == "healthy":
                 healthy_nodes += 1
@@ -351,9 +433,13 @@ async def get_system_overview(
     try:
         from sqlalchemy import func
 
+        # Trigger health check
+        task = asyncio.create_task(update_all_nodes_health(db))
+        await task
+
         # Storage nodes stats
         total_nodes = db.query(StorageNode).count()
-        active_nodes = db.query(StorageNode).filter(StorageNode.is_active == True).count()
+        active_nodes = db.query(StorageNode).filter(StorageNode.is_active == True, StorageNode.health_status == "healthy").count()
 
         # Total storage capacity
         total_capacity = db.query(func.coalesce(func.sum(StorageNode.total_space), 0)).scalar()
@@ -404,6 +490,10 @@ async def debug_storage_nodes(
 ):
     """Debug endpoint to check storage nodes status"""
     try:
+        # Trigger health check
+        task = asyncio.create_task(update_all_nodes_health(db))
+        await task
+
         # Check all storage nodes
         all_nodes = db.query(StorageNode).all()
 

@@ -35,7 +35,7 @@ def store_chunk_on_node(
     """
     try:
         if storage_method == "http" and node.node_url and "localhost" not in node.node_url:
-            # Send chunk to remote node via HTTP (NOT IMPLEMENTED YET, PROBABLY NOT GONNA)
+            # Send chunk to remote node via HTTP (NOT IMPLEMENTED)
             # DO NOT USE
             return store_chunk_via_http(
                 chunk_data=chunk_data,
@@ -70,32 +70,62 @@ def store_chunk_locally(
         # Create chunks directory if it doesn't exist
         chunks_dir = os.path.join(node_path, "chunks")
         os.makedirs(chunks_dir, exist_ok=True)
-
         # Create filename: {file_hash}_{chunk_index}_{chunk_hash[:8]}.chunk
         chunk_filename = f"{file_hash}_{chunk_index}_{chunk_hash[:8]}.chunk"
         chunk_path = os.path.join(chunks_dir, chunk_filename)
 
-        # Save chunk
-        with open(chunk_path, 'wb') as f:
-            f.write(chunk_data)
+        # If file already exists and matches hash, treat as success (idempotent)
+        if os.path.exists(chunk_path):
+            try:
+                with open(chunk_path, 'rb') as f:
+                    existing = f.read()
+                if hashlib.sha256(existing).hexdigest() == chunk_hash:
+                    logger.debug(f"Chunk already present and valid: {chunk_path}")
+                    return True
+                else:
+                    # Existing file differs; overwrite atomically below
+                    logger.warning(f"Existing chunk file differs, will overwrite: {chunk_path}")
+            except Exception:
+                # If reading fails, attempt to overwrite
+                logger.warning(f"Unable to read existing chunk, will overwrite: {chunk_path}")
 
-        # Verify the chunk was written correctly
-        with open(chunk_path, 'rb') as f:
-            stored_data = f.read()
-            if len(stored_data) != len(chunk_data):
-                os.remove(chunk_path)
-                logger.error(f"Chunk size mismatch for {chunk_filename}")
-                return False
+        # Write to a temporary file then atomically replace
+        tmp_path = chunk_path + ".tmp"
+        try:
+            with open(tmp_path, 'wb') as f:
+                f.write(chunk_data)
 
-            # Optional: verify hash
-            verify_hash = hashlib.sha256(stored_data).hexdigest()
-            if verify_hash != chunk_hash:
-                os.remove(chunk_path)
-                logger.error(f"Chunk hash mismatch for {chunk_filename}")
-                return False
+            # Verify written tmp file
+            with open(tmp_path, 'rb') as f:
+                stored_data = f.read()
+                if len(stored_data) != len(chunk_data):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    logger.error(f"Chunk size mismatch writing tmp for {chunk_filename}")
+                    return False
 
-        logger.debug(f"Stored chunk locally: {chunk_path} ({len(chunk_data)} bytes)")
-        return True
+                verify_hash = hashlib.sha256(stored_data).hexdigest()
+                if verify_hash != chunk_hash:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    logger.error(f"Chunk hash mismatch writing tmp for {chunk_filename}")
+                    return False
+
+            # Atomically move tmp to final path
+            os.replace(tmp_path, chunk_path)
+            logger.debug(f"Stored chunk locally atomically: {chunk_path} ({len(chunk_data)} bytes)")
+            return True
+        finally:
+            # Ensure tmp cleanup if anything left
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     except Exception as e:
         logger.error(f"Error storing chunk locally: {str(e)}")

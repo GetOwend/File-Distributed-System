@@ -10,11 +10,12 @@ from app.models.file_models import StorageNode
 logger = logging.getLogger(__name__)
 
 def get_available_storage_nodes(db: Session, min_space_mb: int = 10) -> List:
-    """Get all storage nodes (relaxed for testing)"""
-    # For testing, don't filter by health_status
+    """Get all storage nodes (for testing)"""
+    # For testing, including filter by health_status
     nodes = db.query(StorageNode).filter(
         StorageNode.is_active == True,
-        StorageNode.available_space >= (min_space_mb * 1024 * 1024)
+        StorageNode.available_space >= (min_space_mb * 1024 * 1024),
+        StorageNode.health_status == "healthy"
     ).order_by(
         StorageNode.priority.desc(),
         StorageNode.available_space.desc()

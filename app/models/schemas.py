@@ -235,10 +235,10 @@ class StorageNodeUpdate(BaseModel):
 class StorageNodeStatus(BaseModel):
     node_id: int
     node_name: str
-    status: str
+    status: Optional[str]
     last_checked: Optional[datetime]
     response_time: Optional[float]
-    details: Optional[str]
+    details: Optional[dict] = None
 
 class NodeHealthResponse(BaseModel):
     overall_health: str

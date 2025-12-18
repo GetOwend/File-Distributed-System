@@ -29,5 +29,7 @@ class Settings:
     STORAGE_PATH: str = os.path.join(BASE_DIR, "storage")
     MAX_FILE_SIZE: int = 100 * 1024 * 1024  # 100MB
     ALLOWED_EXTENSIONS: List[str] = [".txt", ".pdf", ".jpg", ".png", ".doc", ".docx"]
+    # Whether to treat nodes as HTTP services (True) or local directories (False)
+    USE_HTTP_NODES: bool = os.getenv("USE_HTTP_NODES", "False").lower() == "true"
 
 settings = Settings()

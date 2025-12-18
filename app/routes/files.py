@@ -26,6 +26,7 @@ from app.utils.file_chunker import split_file_into_chunks
 from app.utils.node_selector import get_available_storage_nodes, select_nodes_for_chunks
 from app.utils.chunk_storage import retrieve_chunk_from_node, store_chunk_on_node
 from app.utils.cleanup import cleanup_temp_files
+from app.utils.repair import repair_file_by_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,7 +46,7 @@ async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     chunk_size_mb: int = Query(5, description="Chunk size in MB (default: 5)"),
-    replication_factor: int = Query(2, description="Number of replicas per chunk (default: 2)"),
+    replication_factor: int = Query(3, description="Number of replicas per chunk (default: 2)"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -124,6 +125,8 @@ async def upload_file(
         chunk_metadata_records = []
         total_stored_size = 0
         nodes_used = set()
+        # Track per-node usage increments to update atomically later
+        node_usage_increments = {}
 
         for i, chunk_data in enumerate(chunks):
             chunk_hash = hashlib.sha256(chunk_data).hexdigest()
@@ -155,22 +158,24 @@ async def upload_file(
                     chunk_stored_successfully = True
                     nodes_used.add(node_id)
 
-                    # Update node storage usage
-                    storage_node.used_space = (storage_node.used_space or 0) + len(chunk_data)
-                    storage_node.available_space = max(0, storage_node.total_space - storage_node.used_space)
+                    # Accumulate usage increments (will apply with SELECT FOR UPDATE)
+                    node_usage_increments[node_id] = node_usage_increments.get(node_id, 0) + len(chunk_data)
 
             # Create chunk metadata
+            # Use the first actually-stored node as the primary (if any)
+            primary_node = stored_on_nodes[0] if stored_on_nodes else None
+            backup_ids_for_meta = stored_on_nodes[1:] if len(stored_on_nodes) > 1 else []
+
             chunk_metadata = FileChunk(
                 file_hash=file_hash,
                 chunk_index=i,
                 chunk_hash=chunk_hash,
                 size=len(chunk_data),
-                primary_node_id=assigned_node_ids[0] if assigned_node_ids else None,
-                backup_node_ids=json.dumps(assigned_node_ids[1:]) if len(assigned_node_ids) > 1 else None,
+                primary_node_id=primary_node,
+                backup_node_ids=json.dumps(backup_ids_for_meta) if backup_ids_for_meta else None,
                 stored_on_nodes=json.dumps(stored_on_nodes),
                 is_stored=chunk_stored_successfully
             )
-            db.add(chunk_metadata)
             chunk_metadata_records.append(chunk_metadata)
 
             # If chunk storage failed, raise error
@@ -182,7 +187,6 @@ async def upload_file(
 
         # 4. CREATE FILE METADATA
         unique_filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}_{file.filename}"
-
         db_file = FileMetadata(
             filename=unique_filename,
             original_filename=file.filename,
@@ -197,10 +201,33 @@ async def upload_file(
             stored_size=total_stored_size,  # Actual stored size (with replication)
             is_chunked=True
         )
-        db.add(db_file)
 
-        # Commit all changes
-        db.commit()
+        # Apply node usage updates and persist chunk metadata and file metadata atomically
+        try:
+            # Lock and update storage node usage
+            for node_id, inc in node_usage_increments.items():
+                node_row = db.query(StorageNode).filter(StorageNode.id == node_id).with_for_update().first()
+                if node_row:
+                    node_row.used_space = (node_row.used_space or 0) + inc
+                    node_row.available_space = max(0, node_row.total_space - node_row.used_space)
+                    db.add(node_row)
+
+            # Add chunk metadata records
+            for cm in chunk_metadata_records:
+                db.add(cm)
+
+            # Add file metadata
+            db.add(db_file)
+
+            # Commit the transaction explicitly to avoid nested begin() on the session
+            db.commit()
+
+        except Exception as e:
+            logger.error(f"DB transaction failed during upload metadata persist: {str(e)}")
+            db.rollback()
+            raise
+
+        # Refresh db_file after commit
         db.refresh(db_file)
 
         # 5. CLEANUP TEMP FILES
@@ -759,6 +786,7 @@ async def update_file(
             chunk_metadata_records = []
             total_stored_size = 0
             nodes_used = set()
+            node_usage_increments = {}
 
             for i, chunk_data in enumerate(chunks):
                 chunk_hash = hashlib.sha256(chunk_data).hexdigest()
@@ -787,22 +815,24 @@ async def update_file(
                         chunk_stored_successfully = True
                         nodes_used.add(node_id)
 
-                        # Update node storage usage
-                        storage_node.used_space = (storage_node.used_space or 0) + len(chunk_data)
-                        storage_node.available_space = max(0, storage_node.total_space - storage_node.used_space)
+                        # Accumulate usage increments
+                        node_usage_increments[node_id] = node_usage_increments.get(node_id, 0) + len(chunk_data)
 
                 # Create chunk metadata for new version
+                primary_node = stored_on_nodes[0] if stored_on_nodes else None
+                backup_ids_for_meta = stored_on_nodes[1:] if len(stored_on_nodes) > 1 else []
+
                 chunk_metadata = FileChunk(
                     file_hash=file_hash,
                     chunk_index=i,
                     chunk_hash=chunk_hash,
                     size=len(chunk_data),
-                    primary_node_id=assigned_node_ids[0] if assigned_node_ids else None,
-                    backup_node_ids=json.dumps(assigned_node_ids[1:]) if len(assigned_node_ids) > 1 else None,
+                    primary_node_id=primary_node,
+                    backup_node_ids=json.dumps(backup_ids_for_meta) if backup_ids_for_meta else None,
                     stored_on_nodes=json.dumps(stored_on_nodes),
                     is_stored=chunk_stored_successfully
                 )
-                db.add(chunk_metadata)
+                # do not persist chunk metadata yet; collect for atomic commit
                 chunk_metadata_records.append(chunk_metadata)
 
                 if not chunk_stored_successfully:
@@ -831,10 +861,32 @@ async def update_file(
                 previous_version_id=current_file.id,
                 is_latest_version=True
             )
-            db.add(new_version)
+            # Persist changes atomically: update node usage, add new chunks and file version,
+            # and mark old version as not latest
+            try:
+                # update node usage with SELECT FOR UPDATE
+                for node_id, inc in node_usage_increments.items():
+                    node_row = db.query(StorageNode).filter(StorageNode.id == node_id).with_for_update().first()
+                    if node_row:
+                        node_row.used_space = (node_row.used_space or 0) + inc
+                        node_row.available_space = max(0, node_row.total_space - node_row.used_space)
+                        db.add(node_row)
 
-            # 5. Mark old version as not latest
-            current_file.is_latest_version = False
+                # add chunk metadata for new version
+                for cm in chunk_metadata_records:
+                    db.add(cm)
+
+                # add new version and mark old as not latest
+                db.add(new_version)
+                current_file.is_latest_version = False
+
+                # Commit explicitly (avoid nested begin())
+                db.commit()
+
+            except Exception as e:
+                logger.error(f"DB transaction failed during file update persist: {str(e)}")
+                db.rollback()
+                raise
 
             # 6. Cleanup temp files
             background_tasks.add_task(cleanup_temp_files, temp_dir)
@@ -845,7 +897,6 @@ async def update_file(
                 old_file_hash=current_file.file_hash
             )
 
-            db.commit()
             db.refresh(new_version)
 
             logger.info(f"File updated to version {new_version.version}: {new_file.filename}")
@@ -946,6 +997,35 @@ async def schedule_garbage_collection(old_file_hash: str):
         logger.error(f"Error in garbage collection: {str(e)}")
     finally:
         db.close()
+
+
+@router.post("/files/{file_id}/repair")
+async def trigger_repair(
+    file_id: int,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Trigger repair/healing for a specific file (runs in background)."""
+    try:
+        file_meta = db.query(FileMetadata).filter(
+            FileMetadata.id == file_id,
+            FileMetadata.owner_id == current_user.id,
+            FileMetadata.is_deleted == False
+        ).first()
+
+        if not file_meta:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        background_tasks.add_task(repair_file_by_id, file_id)
+
+        return {"message": "Repair scheduled", "file_id": file_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error scheduling repair: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to schedule repair")
 
 @router.get("/files/{file_id}/versions")
 async def get_file_versions(
